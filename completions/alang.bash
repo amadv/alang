@@ -3,7 +3,7 @@
 # Source this or add to your completions directory
 
 _alang_tools() {
-  echo "node ruby php java python composer"
+  echo "node ruby php java python composer go rust"
 }
 
 _alang_completion() {
@@ -26,7 +26,7 @@ _alang_completion() {
       COMPREPLY=($(compgen -W "$tools" -- "$cur"))
       return 0
       ;;
-    node|ruby|php|java|python|composer)
+    node|ruby|php|java|python|composer|go|rust)
       # List installed versions for this tool
       local tool_dir="$HOME/.alang/versions/$prev"
       if [[ -d "$tool_dir" ]]; then
@@ -62,11 +62,14 @@ if [[ -n "${ZSH_VERSION:-}" ]]; then
       'which:Show bin path for tool'
       'env:Print PATH exports'
       'shell:Print shell integration'
+      'exec:Execute a binary via alang'
       'uninstall:Remove a version'
       'prune:Remove non-active versions'
       'doctor:Check system health'
       'auth:Store Anthropic API key'
       'ask:Ask Claude a question'
+      'add:Generate installer for a new tool'
+      'version:Show alang version'
     )
 
     tools=(
@@ -76,6 +79,8 @@ if [[ -n "${ZSH_VERSION:-}" ]]; then
       'java:Java Development Kit'
       'python:Python programming language'
       'composer:PHP Composer package manager'
+      'go:Go programming language'
+      'rust:Rust programming language'
     )
 
     _arguments \
