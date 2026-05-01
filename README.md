@@ -1,4 +1,4 @@
-# alang
+#  ∴ alang
 
 **AI-powered version manager** — like `mise` or `asdf`, but shell-native with Claude intelligence built in.
 
