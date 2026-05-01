@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 # alang - AI-powered version manager
-# Like mise, but shell-native with Claude intelligence
 
 set -euo pipefail
 
