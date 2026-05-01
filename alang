@@ -1,0 +1,846 @@
+#!/usr/bin/env bash
+# alang - AI-powered version manager
+# Like mise, but shell-native with Claude intelligence
+
+set -euo pipefail
+
+ALANG_VERSION="1.0.0"
+ALANG_DIR="${ALANG_DIR:-$HOME/.alang}"
+ALANG_VERSIONS_DIR="$ALANG_DIR/versions"
+ALANG_SHIMS_DIR="$ALANG_DIR/shims"
+ALANG_CONFIG="$ALANG_DIR/config"
+ALANG_TOML=".alang-version"
+ALANG_BIN="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/alang"
+LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+RESET='\033[0m'
+
+# ─────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────
+
+log_info()    { echo -e "${CYAN}→${RESET} $*"; }
+log_success() { echo -e "${GREEN}✓${RESET} $*"; }
+log_warn()    { echo -e "${YELLOW}⚠${RESET} $*"; }
+log_error()   { echo -e "${RED}✗${RESET} $*" >&2; }
+log_dim()     { echo -e "${DIM}  $*${RESET}"; }
+log_header()  { echo -e "\n${BOLD}${BLUE}$*${RESET}"; }
+
+die() { log_error "$*"; exit 1; }
+
+require_cmd() {
+  command -v "$1" &>/dev/null || die "Required command not found: $1"
+}
+
+spinner() {
+  local pid=$1 msg=${2:-"Working..."}
+  local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+  local i=0
+  while kill -0 "$pid" 2>/dev/null; do
+    printf "\r${CYAN}%s${RESET} %s" "${frames[$((i % 10))]}" "$msg"
+    sleep 0.08
+    ((i++))
+  done
+  printf "\r\033[K"
+}
+
+init_dirs() {
+  mkdir -p "$ALANG_VERSIONS_DIR" "$ALANG_SHIMS_DIR" "$ALANG_CONFIG"
+}
+
+# ─────────────────────────────────────────
+# Claude AI Integration
+# ─────────────────────────────────────────
+
+alang_claude() {
+  local prompt="$1"
+  local api_key="${ANTHROPIC_API_KEY:-}"
+
+  if [[ -z "$api_key" ]]; then
+    # Try reading from config
+    if [[ -f "$ALANG_DIR/anthropic_key" ]]; then
+      api_key=$(cat "$ALANG_DIR/anthropic_key")
+    else
+      return 1
+    fi
+  fi
+
+  local payload
+  payload=$(jq -n \
+    --arg model "claude-opus-4-5" \
+    --arg prompt "$prompt" \
+    '{
+      model: $model,
+      max_tokens: 1024,
+      messages: [{ role: "user", content: $prompt }]
+    }')
+
+  local response
+  response=$(curl -sf \
+    -X POST "https://api.anthropic.com/v1/messages" \
+    -H "x-api-key: $api_key" \
+    -H "anthropic-version: 2023-06-01" \
+    -H "content-type: application/json" \
+    -d "$payload" 2>/dev/null) || return 1
+
+  echo "$response" | jq -r '.content[0].text // empty'
+}
+
+ask_claude() {
+  # Ask Claude a question and stream the answer to terminal
+  local question="$1"
+
+  local api_key="${ANTHROPIC_API_KEY:-}"
+  if [[ -z "$api_key" ]] && [[ -f "$ALANG_DIR/anthropic_key" ]]; then
+    api_key=$(cat "$ALANG_DIR/anthropic_key")
+  fi
+
+  if [[ -z "$api_key" ]]; then
+    log_warn "No ANTHROPIC_API_KEY set. Run: alang auth <your-api-key>"
+    log_warn "Falling back to built-in logic..."
+    return 1
+  fi
+
+  echo -e "${CYAN}🤖 Claude:${RESET}"
+
+  local payload
+  payload=$(jq -n \
+    --arg model "claude-opus-4-5" \
+    --arg sys "You are an expert developer tool assistant for 'alang', a version manager like mise/asdf. Be concise, technical, and helpful. Use plain text, no markdown formatting. Focus on practical answers about Node.js, Ruby, PHP, Java, Python version management." \
+    --arg q "$question" \
+    '{
+      model: $model,
+      max_tokens: 800,
+      system: $sys,
+      messages: [{ role: "user", content: $q }]
+    }')
+
+  curl -sf \
+    -X POST "https://api.anthropic.com/v1/messages" \
+    -H "x-api-key: $api_key" \
+    -H "anthropic-version: 2023-06-01" \
+    -H "content-type: application/json" \
+    -d "$payload" 2>/dev/null \
+    | jq -r '.content[0].text // "No response from Claude."'
+}
+
+claude_recommend_version() {
+  local tool="$1"
+  local context="${2:-latest stable}"
+
+  local answer
+  answer=$(alang_claude "What is the current latest stable version of $tool as of 2024? Reply with ONLY the version number, nothing else. Examples: '20.11.0' for Node.js, '3.2.2' for Ruby, '8.3.2' for PHP, '21.0.1' for Java, '3.12.2' for Python. Tool: $tool") || true
+
+  if [[ -n "$answer" ]] && echo "$answer" | grep -qE '^[0-9]+\.[0-9]'; then
+    echo "$answer" | tr -d ' \n'
+  else
+    # Fallback defaults
+    case "$tool" in
+      node|nodejs) echo "20.11.0" ;;
+      ruby)        echo "3.2.2" ;;
+      php)         echo "8.3.2" ;;
+      java)        echo "21.0.1" ;;
+      python)      echo "3.12.2" ;;
+      *)           echo "latest" ;;
+    esac
+  fi
+}
+
+# ─────────────────────────────────────────
+# Source installer modules
+# ─────────────────────────────────────────
+
+source_installer() {
+  local tool="$1"
+  local installer="$LIB_DIR/install_${tool}.sh"
+  if [[ -f "$installer" ]]; then
+    # shellcheck source=/dev/null
+    source "$installer"
+  else
+    die "No installer found for: $tool"
+  fi
+}
+
+# ─────────────────────────────────────────
+# Shim management
+# ─────────────────────────────────────────
+
+write_shim() {
+  local name="$1"
+  local shim_path="$ALANG_SHIMS_DIR/$name"
+
+  cat > "$shim_path" <<'SHIM'
+#!/usr/bin/env bash
+# alang shim
+exec alang exec "$(basename "$0")" "$@"
+SHIM
+  chmod +x "$shim_path"
+}
+
+rebuild_shims() {
+  log_info "Rebuilding shims..."
+  # Walk all installed versions and create shims for their binaries
+  for tool_dir in "$ALANG_VERSIONS_DIR"/*/; do
+    local tool
+    tool=$(basename "$tool_dir")
+    for version_dir in "$tool_dir"*/; do
+      [[ -d "$version_dir/bin" ]] || continue
+      for bin in "$version_dir/bin/"*; do
+        [[ -x "$bin" ]] || continue
+        local bin_name
+        bin_name=$(basename "$bin")
+        write_shim "$bin_name"
+      done
+    done
+  done
+  log_success "Shims rebuilt in $ALANG_SHIMS_DIR"
+}
+
+# ─────────────────────────────────────────
+# Version file (.alang-version)
+# ─────────────────────────────────────────
+
+read_version_file() {
+  local dir="${1:-$(pwd)}"
+  local file
+
+  # Walk up to find .alang-version
+  while [[ "$dir" != "/" ]]; do
+    file="$dir/$ALANG_TOML"
+    if [[ -f "$file" ]]; then
+      echo "$file"
+      return
+    fi
+    dir=$(dirname "$dir")
+  done
+}
+
+get_project_version() {
+  local tool="$1"
+  local vfile
+  vfile=$(read_version_file) || true
+
+  if [[ -n "$vfile" ]]; then
+    grep -E "^${tool}\s*=" "$vfile" 2>/dev/null | sed 's/.*=\s*//' | tr -d ' "' | head -1
+  fi
+}
+
+set_project_version() {
+  local tool="$1"
+  local version="$2"
+  local file="${ALANG_TOML}"
+
+  touch "$file"
+
+  if grep -qE "^${tool}\s*=" "$file" 2>/dev/null; then
+    # Update existing
+    sed -i.bak "s|^${tool}\s*=.*|${tool} = ${version}|" "$file"
+    rm -f "${file}.bak"
+  else
+    echo "${tool} = ${version}" >> "$file"
+  fi
+
+  log_success "Set $tool = $version in $file"
+}
+
+# ─────────────────────────────────────────
+# Core: list, use, which
+# ─────────────────────────────────────────
+
+cmd_list() {
+  local filter="${1:-}"
+  log_header "Installed versions"
+  echo ""
+
+  local found=false
+  for tool_dir in "$ALANG_VERSIONS_DIR"/*/; do
+    [[ -d "$tool_dir" ]] || continue
+    local tool
+    tool=$(basename "$tool_dir")
+    [[ -n "$filter" && "$tool" != "$filter" ]] && continue
+
+    found=true
+    echo -e "  ${BOLD}${tool}${RESET}"
+    for ver_dir in "$tool_dir"*/; do
+      [[ -d "$ver_dir" ]] || continue
+      local ver
+      ver=$(basename "$ver_dir")
+      local active
+      active=$(get_active_version "$tool") || true
+      if [[ "$ver" == "$active" ]]; then
+        echo -e "    ${GREEN}● $ver${RESET} ${DIM}(active)${RESET}"
+      else
+        echo -e "    ${DIM}○ $ver${RESET}"
+      fi
+    done
+    echo ""
+  done
+
+  if ! $found; then
+    echo -e "  ${DIM}No versions installed yet. Run: alang install <tool> <version>${RESET}"
+    echo ""
+  fi
+}
+
+get_active_version() {
+  local tool="$1"
+  # Check project file first, then global
+  local ver
+  ver=$(get_project_version "$tool") || true
+  if [[ -z "$ver" ]]; then
+    [[ -f "$ALANG_CONFIG/${tool}_global" ]] && ver=$(cat "$ALANG_CONFIG/${tool}_global")
+  fi
+  echo "$ver"
+}
+
+cmd_which() {
+  local tool="$1"
+  local ver
+  ver=$(get_active_version "$tool") || die "No version set for $tool"
+  [[ -n "$ver" ]] || die "No version set for $tool"
+
+  local bin_dir="$ALANG_VERSIONS_DIR/$tool/$ver/bin"
+  [[ -d "$bin_dir" ]] || die "Version $ver of $tool not installed"
+  echo "$bin_dir"
+}
+
+cmd_use() {
+  local tool="$1"
+  local version="${2:-}"
+
+  if [[ -z "$version" ]]; then
+    log_info "No version specified, asking Claude for recommendation..."
+    version=$(claude_recommend_version "$tool")
+    log_info "Claude recommends: $version"
+  fi
+
+  # Ensure it's installed
+  local ver_dir="$ALANG_VERSIONS_DIR/$tool/$version"
+  if [[ ! -d "$ver_dir" ]]; then
+    log_warn "$tool $version not installed. Installing now..."
+    cmd_install "$tool" "$version"
+  fi
+
+  set_project_version "$tool" "$version"
+  log_success "Now using $tool $version"
+}
+
+cmd_global() {
+  local tool="$1"
+  local version="${2:-}"
+
+  if [[ -z "$version" ]]; then
+    version=$(claude_recommend_version "$tool")
+    log_info "Claude recommends: $version"
+  fi
+
+  local ver_dir="$ALANG_VERSIONS_DIR/$tool/$version"
+  if [[ ! -d "$ver_dir" ]]; then
+    log_warn "$tool $version not installed. Installing now..."
+    cmd_install "$tool" "$version"
+  fi
+
+  echo "$version" > "$ALANG_CONFIG/${tool}_global"
+  log_success "Set global $tool = $version"
+}
+
+# ─────────────────────────────────────────
+# Install
+# ─────────────────────────────────────────
+
+cmd_install() {
+  local tool="${1:-}"
+  local version="${2:-}"
+
+  [[ -n "$tool" ]] || die "Usage: alang install <tool> [version]"
+
+  # Normalize tool name
+  case "$tool" in
+    node|nodejs|node.js) tool="node" ;;
+    python|python3|py)   tool="python" ;;
+    ruby|rb)             tool="ruby" ;;
+    php)                 tool="php" ;;
+    java|jdk|openjdk)    tool="java" ;;
+    composer)            tool="composer" ;;
+    go|golang)           tool="go" ;;
+    rust|rustlang|rs)    tool="rust" ;;
+  esac
+
+  if [[ -z "$version" || "$version" == "latest" ]]; then
+    log_info "Asking Claude for the latest stable $tool version..."
+    version=$(claude_recommend_version "$tool")
+    log_success "Using $tool $version"
+  fi
+
+  local ver_dir="$ALANG_VERSIONS_DIR/$tool/$version"
+  if [[ -d "$ver_dir" ]]; then
+    log_warn "$tool $version already installed at $ver_dir"
+    return
+  fi
+
+  init_dirs
+  source_installer "$tool"
+
+  log_header "Installing $tool $version"
+  install_tool "$version" "$ver_dir"
+
+  log_success "Installed $tool $version"
+
+  # Auto-set as active if none set
+  local current
+  current=$(get_active_version "$tool") || true
+  if [[ -z "$current" ]]; then
+    echo "$version" > "$ALANG_CONFIG/${tool}_global"
+    log_info "Set as global default"
+  fi
+
+  rebuild_shims 2>/dev/null || true
+}
+
+cmd_uninstall() {
+  local tool="$1"
+  local version="$2"
+
+  local ver_dir="$ALANG_VERSIONS_DIR/$tool/$version"
+  [[ -d "$ver_dir" ]] || die "$tool $version is not installed"
+
+  rm -rf "$ver_dir"
+  log_success "Uninstalled $tool $version"
+}
+
+# ─────────────────────────────────────────
+# exec: run a binary in the right version
+# ─────────────────────────────────────────
+
+cmd_exec() {
+  local bin="$1"
+  shift
+  local tool
+
+  # Map binary to tool
+  case "$bin" in
+    node|npm|npx|corepack) tool="node" ;;
+    ruby|gem|bundle|bundler|irb|erb) tool="ruby" ;;
+    php|composer) 
+      [[ "$bin" == "composer" ]] && tool="composer" || tool="php" ;;
+    java|javac|jar|javadoc) tool="java" ;;
+    python|python3|pip|pip3) tool="python" ;;
+    *) die "Unknown binary: $bin" ;;
+  esac
+
+  local ver
+  ver=$(get_active_version "$tool") || die "No $tool version active"
+  [[ -n "$ver" ]] || die "No $tool version set. Run: alang use $tool"
+
+  local bin_path="$ALANG_VERSIONS_DIR/$tool/$ver/bin/$bin"
+  [[ -x "$bin_path" ]] || die "$bin not found in $tool $ver installation"
+
+  exec "$bin_path" "$@"
+}
+
+# ─────────────────────────────────────────
+# env: print shell export lines
+# ─────────────────────────────────────────
+
+cmd_env() {
+  local paths=()
+
+  for tool in node ruby php java python composer go rust; do
+    local ver
+    ver=$(get_active_version "$tool") || true
+    [[ -z "$ver" ]] && continue
+    local bin_dir="$ALANG_VERSIONS_DIR/$tool/$ver/bin"
+    [[ -d "$bin_dir" ]] && paths+=("$bin_dir")
+  done
+
+  if [[ ${#paths[@]} -gt 0 ]]; then
+    local path_str
+    path_str=$(IFS=:; echo "${paths[*]}")
+    echo "export PATH=\"${path_str}:\$PATH\""
+    echo "# Run: eval \"\$(alang env)\" or add to your shell profile"
+  else
+    echo "# No alang versions active"
+  fi
+}
+
+# ─────────────────────────────────────────
+# shell: inject PATH into current shell
+# ─────────────────────────────────────────
+
+cmd_shell_init() {
+  local shell="${1:-$(basename "$SHELL")}"
+  cat <<SHELLINIT
+# alang shell integration
+# Add this to your ~/.bashrc or ~/.zshrc:
+export ALANG_DIR="\$HOME/.alang"
+export PATH="\$ALANG_DIR/shims:\$PATH"
+eval "\$(${ALANG_BIN} env)"
+
+# For directory-based version switching, add:
+# alang_cd() { cd "\$@" && eval "\$(${ALANG_BIN} env)"; }
+# alias cd=alang_cd
+SHELLINIT
+}
+
+# ─────────────────────────────────────────
+# auth: store API key
+# ─────────────────────────────────────────
+
+cmd_auth() {
+  local key="${1:-}"
+  if [[ -z "$key" ]]; then
+    echo -n "Enter Anthropic API key: "
+    read -rs key
+    echo ""
+  fi
+  init_dirs
+  echo "$key" > "$ALANG_DIR/anthropic_key"
+  chmod 600 "$ALANG_DIR/anthropic_key"
+  log_success "API key saved to $ALANG_DIR/anthropic_key"
+}
+
+# ─────────────────────────────────────────
+# ask: free-form Claude question
+# ─────────────────────────────────────────
+
+cmd_ask() {
+  local question="$*"
+  [[ -n "$question" ]] || die "Usage: alang ask <question>"
+  echo ""
+  ask_claude "$question"
+  echo ""
+}
+
+# ─────────────────────────────────────────
+# doctor: check system health
+# ─────────────────────────────────────────
+
+cmd_doctor() {
+  log_header "alang doctor"
+  echo ""
+
+  # Check dirs
+  echo -e "  ${BOLD}Directories${RESET}"
+  for d in "$ALANG_DIR" "$ALANG_VERSIONS_DIR" "$ALANG_SHIMS_DIR" "$ALANG_CONFIG"; do
+    if [[ -d "$d" ]]; then
+      echo -e "  ${GREEN}✓${RESET} $d"
+    else
+      echo -e "  ${YELLOW}○${RESET} $d ${DIM}(will be created on first use)${RESET}"
+    fi
+  done
+  echo ""
+
+  # Check deps
+  echo -e "  ${BOLD}Dependencies${RESET}"
+  for cmd in curl wget tar jq git; do
+    if command -v "$cmd" &>/dev/null; then
+      echo -e "  ${GREEN}✓${RESET} $cmd $(${cmd} --version 2>&1 | head -1 | grep -oE '[0-9]+\.[0-9]+' | head -1)"
+    else
+      echo -e "  ${RED}✗${RESET} $cmd ${DIM}(missing)${RESET}"
+    fi
+  done
+  echo ""
+
+  # Check API key
+  echo -e "  ${BOLD}Claude AI${RESET}"
+  if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+    echo -e "  ${GREEN}✓${RESET} ANTHROPIC_API_KEY set via environment"
+  elif [[ -f "$ALANG_DIR/anthropic_key" ]]; then
+    echo -e "  ${GREEN}✓${RESET} API key stored in $ALANG_DIR/anthropic_key"
+  else
+    echo -e "  ${YELLOW}○${RESET} No API key (run: alang auth <key> or set ANTHROPIC_API_KEY)"
+  fi
+  echo ""
+
+  # Check installed versions
+  echo -e "  ${BOLD}Installed tools${RESET}"
+  local found=false
+  for tool in node ruby php java python composer go rust; do
+    local ver
+    ver=$(get_active_version "$tool") || true
+    if [[ -n "$ver" ]]; then
+      found=true
+      echo -e "  ${GREEN}✓${RESET} $tool ${CYAN}$ver${RESET}"
+    fi
+  done
+  $found || echo -e "  ${DIM}No tools installed yet${RESET}"
+  echo ""
+}
+
+# ─────────────────────────────────────────
+# prune: remove old versions
+# ─────────────────────────────────────────
+
+cmd_prune() {
+  local tool="${1:-}"
+  log_header "Pruning old versions"
+  echo ""
+
+  for tool_dir in "$ALANG_VERSIONS_DIR"/*/; do
+    [[ -d "$tool_dir" ]] || continue
+    local t
+    t=$(basename "$tool_dir")
+    [[ -n "$tool" && "$t" != "$tool" ]] && continue
+
+    local active
+    active=$(get_active_version "$t") || true
+
+    for ver_dir in "$tool_dir"*/; do
+      [[ -d "$ver_dir" ]] || continue
+      local ver
+      ver=$(basename "$ver_dir")
+      if [[ "$ver" != "$active" ]]; then
+        log_info "Removing $t $ver..."
+        rm -rf "$ver_dir"
+        log_success "Removed $t $ver"
+      fi
+    done
+  done
+
+  log_success "Prune complete"
+}
+
+# ─────────────────────────────────────────
+# status: show current versions in use
+# ─────────────────────────────────────────
+
+cmd_status() {
+  echo ""
+  echo -e "  ${BOLD}alang${RESET} ${DIM}v${ALANG_VERSION}${RESET}"
+  echo ""
+  
+  local vfile
+  vfile=$(read_version_file) || true
+  if [[ -n "$vfile" ]]; then
+    echo -e "  ${DIM}Project: $vfile${RESET}"
+  else
+    echo -e "  ${DIM}No .alang-version file in current directory tree${RESET}"
+  fi
+  echo ""
+
+  echo -e "  ${BOLD}Active versions${RESET}"
+  for tool in node ruby php java python composer go rust; do
+    local ver
+    ver=$(get_active_version "$tool") || true
+    if [[ -n "$ver" ]]; then
+      local source="global"
+      local proj_ver
+      proj_ver=$(get_project_version "$tool") || true
+      [[ "$proj_ver" == "$ver" ]] && source="project"
+      echo -e "  ${CYAN}$tool${RESET}\t${ver}\t${DIM}($source)${RESET}"
+    else
+      echo -e "  ${DIM}$tool\tnot set${RESET}"
+    fi
+  done
+  echo ""
+}
+
+# ─────────────────────────────────────────
+# add: generate a new installer via Claude
+# ─────────────────────────────────────────
+
+cmd_add() {
+  local tool="${1:-}"
+  [[ -n "$tool" ]] || die "Usage: alang add <tool-name>"
+
+  # Normalize
+  local canonical
+  canonical=$(echo "$tool" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')
+
+  local installer_path="$LIB_DIR/install_${canonical}.sh"
+
+  if [[ -f "$installer_path" ]]; then
+    log_warn "Installer already exists: $installer_path"
+    echo -n "Overwrite? [y/N] "
+    read -r confirm
+    [[ "$confirm" =~ ^[Yy]$ ]] || { log_info "Aborted."; return 0; }
+  fi
+
+  local api_key="${ANTHROPIC_API_KEY:-}"
+  if [[ -z "$api_key" ]] && [[ -f "$ALANG_DIR/anthropic_key" ]]; then
+    api_key=$(cat "$ALANG_DIR/anthropic_key")
+  fi
+  [[ -n "$api_key" ]] || die "No ANTHROPIC_API_KEY. Run: alang auth <key>"
+
+  log_header "Generating installer for: $tool"
+  log_info "Asking Claude to write lib/install_${canonical}.sh ..."
+  echo ""
+
+  local prompt
+  prompt=$(cat <<PROMPT
+You are writing a shell installer module for "alang", a mise-like version manager.
+
+Write a bash installer script for: ${tool}
+
+The script must:
+1. Define exactly one function: install_tool() that takes two args: version and dest
+   - version: the version string to install (e.g. "1.2.3")
+   - dest: the destination directory (e.g. "/home/user/.alang/versions/${canonical}/1.2.3")
+2. Install the tool so that binaries are in \$dest/bin/
+3. Handle macOS (darwin) and Linux differences where applicable
+4. Use curl or wget to download official releases/binaries where available
+5. Fall back to building from source only if no binary distribution exists
+6. Use a tmp_dir with trap 'rm -rf "\$tmp_dir"' EXIT for cleanup
+7. Call log_info, log_warn, log_dim (already defined in parent scope) for output
+8. Call die() on fatal errors
+9. Also define list_remote_versions() that echos available versions, one per line
+
+Available helper functions already in scope (do not redefine):
+- log_info, log_success, log_warn, log_error, log_dim, die
+- require_cmd <cmd>
+- spinner <pid> <message>
+
+The script header comment should be:
+#!/usr/bin/env bash
+# alang installer: ${canonical}
+
+Return ONLY the raw bash script. No markdown, no code fences, no explanation.
+PROMPT
+)
+
+  local payload
+  payload=$(jq -n \
+    --arg model "claude-opus-4-5" \
+    --arg prompt "$prompt" \
+    '{
+      model: $model,
+      max_tokens: 2048,
+      messages: [{ role: "user", content: $prompt }]
+    }')
+
+  local response
+  response=$(curl -sf \
+    -X POST "https://api.anthropic.com/v1/messages" \
+    -H "x-api-key: $api_key" \
+    -H "anthropic-version: 2023-06-01" \
+    -H "content-type: application/json" \
+    -d "$payload" 2>/dev/null) || die "Claude API request failed"
+
+  local script_content
+  script_content=$(echo "$response" | jq -r '.content[0].text // empty')
+
+  [[ -n "$script_content" ]] || die "Claude returned empty response"
+
+  # Strip any accidental markdown fences
+  script_content=$(echo "$script_content" | sed '/^```/d')
+
+  # Write the installer
+  echo "$script_content" > "$installer_path"
+  chmod +x "$installer_path"
+
+  log_success "Installer written: $installer_path"
+  echo ""
+  log_dim "Preview (first 30 lines):"
+  head -30 "$installer_path" | while IFS= read -r line; do
+    log_dim "  $line"
+  done
+  echo ""
+
+  # Register the tool alias in the main binary's normalize case if not already present
+  local alang_bin
+  alang_bin=$(command -v alang 2>/dev/null || echo "$ALANG_BIN")
+
+  log_success "Tool '$tool' is now available. Try:"
+  echo -e "  ${CYAN}alang install ${canonical}${RESET}"
+  echo -e "  ${CYAN}alang install ${canonical} <version>${RESET}"
+  echo ""
+  log_info "To make '${tool}' recognized as '${canonical}', add this alias to alang's normalize block:"
+  echo -e "  ${DIM}${tool}|${canonical}) tool=\"${canonical}\" ;;${RESET}"
+}
+
+# ─────────────────────────────────────────
+# Help
+# ─────────────────────────────────────────
+
+cmd_help() {
+  cat <<HELP
+
+${BOLD}alang${RESET} ${DIM}v${ALANG_VERSION}${RESET} — AI-powered version manager
+
+${BOLD}USAGE${RESET}
+  alang <command> [args]
+
+${BOLD}COMMANDS${RESET}
+  ${CYAN}install${RESET}  <tool> [version]   Install a tool version (Claude picks if omitted)
+  ${CYAN}use${RESET}      <tool> [version]   Set version for current project
+  ${CYAN}global${RESET}   <tool> [version]   Set global default version
+  ${CYAN}add${RESET}      <tool>             Generate a new installer with Claude AI
+  ${CYAN}list${RESET}     [tool]             List installed versions
+  ${CYAN}status${RESET}                      Show active versions
+  ${CYAN}which${RESET}    <tool>             Print active bin path
+  ${CYAN}env${RESET}                         Print shell PATH exports
+  ${CYAN}shell${RESET}                       Print shell integration snippet
+  ${CYAN}uninstall${RESET} <tool> <version>  Remove a version
+  ${CYAN}prune${RESET}    [tool]             Remove non-active versions
+  ${CYAN}doctor${RESET}                      Check system health
+  ${CYAN}auth${RESET}     [api-key]          Store Anthropic API key
+  ${CYAN}ask${RESET}      <question>         Ask Claude anything about your stack
+
+${BOLD}BUILT-IN TOOLS${RESET}
+  node, ruby, php, java, python, composer, go, rust
+
+${BOLD}EXAMPLES${RESET}
+  alang install node              # Claude picks latest stable
+  alang install node 20.11.0
+  alang use python 3.12.2
+  alang global ruby
+  alang add go                    # Claude generates a Go installer
+  alang add rust                  # Claude generates a Rust installer
+  alang add deno                  # Claude generates a Deno installer
+  alang ask "what node version should I use for Next.js 14?"
+  eval "\$(alang env)"
+
+${BOLD}PROJECT FILE${RESET}
+  Create .alang-version in your project:
+    node = 20.11.0
+    python = 3.12.2
+
+${BOLD}SHELL SETUP${RESET}
+  alang shell >> ~/.bashrc && source ~/.bashrc
+
+HELP
+}
+
+# ─────────────────────────────────────────
+# Main dispatch
+# ─────────────────────────────────────────
+
+main() {
+  local cmd="${1:-help}"
+  shift 2>/dev/null || true
+
+  case "$cmd" in
+    install|i)    cmd_install "$@" ;;
+    use)          cmd_use "$@" ;;
+    global|g)     cmd_global "$@" ;;
+    list|ls)      cmd_list "$@" ;;
+    status|st)    cmd_status ;;
+    which)        cmd_which "$@" ;;
+    env)          cmd_env ;;
+    shell)        cmd_shell_init "$@" ;;
+    exec)         cmd_exec "$@" ;;
+    uninstall|rm) cmd_uninstall "$@" ;;
+    prune)        cmd_prune "$@" ;;
+    doctor|check) cmd_doctor ;;
+    auth)         cmd_auth "$@" ;;
+    ask|ai)       cmd_ask "$@" ;;
+    add)          cmd_add "$@" ;;
+    help|--help|-h) cmd_help ;;
+    version|--version|-v) echo "alang $ALANG_VERSION" ;;
+    *)
+      log_error "Unknown command: $cmd"
+      cmd_help
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"
