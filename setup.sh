@@ -5,7 +5,7 @@ set -euo pipefail
 
 ALANG_DIR="${ALANG_DIR:-$HOME/.alang}"
 ALANG_BIN_DIR="$ALANG_DIR/bin"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GITHUB_RAW="https://raw.githubusercontent.com/amadv/alang/main"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -17,6 +17,21 @@ RESET='\033[0m'
 log_info()    { echo -e "${CYAN}→${RESET} $*"; }
 log_success() { echo -e "${GREEN}✓${RESET} $*"; }
 log_dim()     { echo -e "${DIM}  $*${RESET}"; }
+
+# Detect curl-pipe install (no local script file available)
+if [[ -f "${BASH_SOURCE[0]:-}" ]]; then
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+else
+  SCRIPT_DIR=$(mktemp -d)
+  trap 'rm -rf "$SCRIPT_DIR"' EXIT
+  log_info "Downloading alang..."
+  curl -fsSL "$GITHUB_RAW/alang" -o "$SCRIPT_DIR/alang"
+  mkdir -p "$SCRIPT_DIR/lib" "$SCRIPT_DIR/completions"
+  for installer in node python ruby php java composer go rust; do
+    curl -fsSL "$GITHUB_RAW/lib/install_${installer}.sh" -o "$SCRIPT_DIR/lib/install_${installer}.sh"
+  done
+  curl -fsSL "$GITHUB_RAW/completions/alang.bash" -o "$SCRIPT_DIR/completions/alang.bash"
+fi
 
 echo ""
 echo -e "  ${BOLD}alang${RESET} installer"

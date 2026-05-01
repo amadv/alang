@@ -9,9 +9,11 @@ Manages Node.js, Ruby, PHP + Composer, Java (OpenJDK), and Python.
 ## Install
 
 ```bash
-git clone <this-repo> alang
-cd alang
-bash setup.sh
+curl -fsSL https://raw.githubusercontent.com/amadv/alang/main/setup.sh | bash
+```
+
+Then reload your shell:
+```bash
 source ~/.bashrc   # or ~/.zshrc
 ```
 
@@ -21,6 +23,8 @@ export ANTHROPIC_API_KEY=sk-ant-...
 # or:
 alang auth sk-ant-...
 ```
+
+> **Manual install:** `git clone https://github.com/amadv/alang && cd alang && bash setup.sh`
 
 ---
 
@@ -132,6 +136,8 @@ Each tool installer lives in `lib/install_<tool>.sh` — easy to extend.
 | `php` | Any | Homebrew / ondrej PPA / source |
 | `java` | 8–21+ | Eclipse Temurin (Adoptium) binaries |
 | `composer` | 1.x, 2.x | getcomposer.org official installer |
+| `go` | Any | go.dev official binaries |
+| `rust` | stable, nightly, beta, x.y.z | rustup |
 
 ---
 
