@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # alang installer: go
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[[ -z "${_ALANG_HELPERS_LOADED:-}" ]] && source "$SCRIPT_DIR/helpers.sh"
+
 install_tool() {
   local version="$1"
   local dest="$2"

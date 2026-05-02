@@ -1,149 +1,102 @@
-#  ∴ alang
+# alang
 
-**AI-powered version manager** — like `mise` or `asdf`, but shell-native with Claude intelligence built in.
+**Language version manager — Claude-first.**
 
-Manages Node.js, Ruby, PHP + Composer, Java (OpenJDK), and Python.
-
----
-
-## Install
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/amadv/alang/main/setup.sh | bash
-```
-
-Then reload your shell:
-```bash
-source ~/.bashrc   # or ~/.zshrc
-```
-
-Set your Anthropic API key (for AI features):
-```bash
-export ANTHROPIC_API_KEY=sk-ant-...
-# or:
-alang auth sk-ant-...
-```
-
-> **Manual install:** `git clone https://github.com/amadv/alang && cd alang && bash setup.sh`
-
----
-
-## Usage
-
-```bash
-# Install a tool — Claude picks the latest stable version automatically
-alang install node
-alang install python
-alang install go
-alang install ruby
-alang install java
-alang install php
-alang install composer
-alang install rust
-
-# Install specific version
-alang install node 20.11.0
-alang install python 3.12.2
-
-# Set version for current project (writes .alang-version)
-alang use node 20.11.0
-alang use python 3.12.2
-
-# Set global default
-alang global ruby
-alang global java 21
-
-# Check what's installed
-alang list
-alang status
-
-# Ask Claude for advice
-alang ask "what node version should I use for Next.js 14?"
-alang ask "is Python 3.11 or 3.12 better for data science?"
-alang ask "what Ruby version does Rails 7.1 require?"
-
-# Activate versions in current shell
-eval "$(alang env)"
-
-# Health check
-alang doctor
-
-# Remove old versions
-alang prune
-```
-
----
-
-## Project file: `.alang-version`
-
-Add a `.alang-version` file to your project root:
-
-```ini
-node = 20.11.0
-python = 3.12.2
-ruby = 3.2.2
-```
-
-`alang` automatically detects this file and uses those versions.
-
----
-
-## Shell integration
-
-```bash
-# Add to ~/.bashrc or ~/.zshrc:
-export PATH="$HOME/.alang/bin:$HOME/.alang/shims:$PATH"
-eval "$(alang env)"
-```
-
-For automatic version switching when you `cd` into a directory:
-
-```bash
-alang_cd() { cd "$@" && eval "$(alang env)"; }
-alias cd=alang_cd
-```
-
----
-
-## Tab completions
-
-```bash
-# Add to ~/.bashrc:
-source /path/to/alang/completions/alang.bash
-```
+Install and manage language runtimes (Node.js, Python, Ruby, Go, Rust, PHP, Java, Composer)
+by talking to Claude Code directly. No CLI, no PATH pollution, no shell config editing.
 
 ---
 
 ## How it works
 
-- **Versions** are stored in `~/.alang/versions/<tool>/<version>/`
-- **Shims** in `~/.alang/shims/` proxy to the right version
-- **Config** in `~/.alang/config/` stores global defaults
-- **`.alang-version`** in project dirs sets project-specific versions
-- **Claude** answers version questions and picks sensible defaults
+1. Clone this repo and open it in Claude Code.
+2. Tell Claude what you want — "install node 20.11.0", "set python 3.12 as my global", etc.
+3. Claude runs scripts from `scripts/`, tracks state in `state/`, and shows you any shell command you need to run.
 
-Each tool installer lives in `lib/install_<tool>.sh` — easy to extend.
+State lives in markdown files committed to git. Binaries install to `~/.alang/versions/<tool>/<version>/`.
+
+---
+
+## Quick start
+
+```bash
+git clone https://github.com/amadv/alang
+cd alang
+claude  # open Claude Code
+```
+
+Then just talk:
+
+```
+install node 20.11.0
+install the latest stable python
+set node 20.11.0 as my global
+what versions do I have installed?
+how do I activate go 1.22 in my current shell?
+add deno support
+```
+
+---
+
+## Shell activation
+
+Claude will show you the command to activate a version in your current shell:
+
+```bash
+eval "$(bash scripts/env.sh node 20.11.0)"
+```
+
+For a permanent setup, add to your `~/.bashrc` or `~/.zshrc`:
+
+```bash
+export PATH="$HOME/.alang/versions/node/20.11.0/bin:$PATH"
+```
+
+No shims. No `alang` binary on your PATH. Just direct version directories.
 
 ---
 
 ## Supported tools
 
-| Tool | Versions | Source |
-|------|----------|--------|
-| `node` | Any | nodejs.org binary distributions |
-| `python` | Any | python.org source (or python-build) |
-| `ruby` | Any | ruby-lang.org source (or ruby-build) |
-| `php` | Any | Homebrew / ondrej PPA / source |
-| `java` | 8–21+ | Eclipse Temurin (Adoptium) binaries |
-| `composer` | 1.x, 2.x | getcomposer.org official installer |
-| `go` | Any | go.dev official binaries |
-| `rust` | stable, nightly, beta, x.y.z | rustup |
+| Tool | Source |
+|------|--------|
+| `node` | nodejs.org binary distributions |
+| `python` | python.org source (or python-build if available) |
+| `ruby` | ruby-lang.org source (or ruby-build if available) |
+| `php` | Homebrew / ondrej PPA / source |
+| `java` | Eclipse Temurin (Adoptium) binaries |
+| `composer` | getcomposer.org official installer |
+| `go` | go.dev official binaries |
+| `rust` | rustup (non-interactive) |
+
+Ask Claude to add support for any other tool — it will generate a `lib/install_<tool>.sh` following the installer contract in `CLAUDE.md`.
 
 ---
 
-## Environment variables
+## State files
 
-| Variable | Description |
-|----------|-------------|
-| `ANTHROPIC_API_KEY` | API key for Claude AI features |
-| `ALANG_DIR` | Override installation dir (default: `~/.alang`) |
+| File | Purpose |
+|------|---------|
+| `state/installed.md` | Every installed version (tool, version, path, date) |
+| `state/globals.md` | Global default version per tool |
+
+These are committed to git by `scripts/backup.sh` after every operation, giving you a full history of your environment changes.
+
+---
+
+## Scripts (Claude runs these — you can too)
+
+| Script | What it does |
+|--------|-------------|
+| `scripts/install.sh <tool> <version>` | Downloads and installs a version |
+| `scripts/uninstall.sh <tool> <version>` | Removes an installed version |
+| `scripts/env.sh [tool version]` | Emits `export PATH=...` for one or all globals |
+| `scripts/backup.sh [msg]` | Commits `state/` to git |
+
+---
+
+## Adding a new language
+
+Tell Claude: "add support for deno" (or elixir, bun, zig, etc.)
+
+Claude generates `lib/install_<tool>.sh` following the installer contract in `CLAUDE.md`, tests it, and commits it.
